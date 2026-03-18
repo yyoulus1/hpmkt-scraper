@@ -9,9 +9,9 @@ on:
         default: 'scrape_only'
         type: choice
         options:
-          - harvest_urls        # Step 1 — build urls.xlsx from the directory
-          - scrape_only         # Step 2 — scrape exhibitor pages (uses uploaded urls.xlsx)
-          - harvest_then_scrape # Both steps in sequence
+          - harvest_urls
+          - scrape_only
+          - harvest_then_scrape
       test_mode:
         description: 'Test mode — scrape only first 3 URLs (scrape step only)'
         required: true
@@ -20,12 +20,10 @@ on:
         options: ['yes', 'no']
 
 jobs:
-  # ── Job 1: Harvest URLs ───────────────────────────────────────────────────
   harvest:
     name: Harvest Exhibitor URLs
     runs-on: ubuntu-22.04
     if: ${{ inputs.mode == 'harvest_urls' || inputs.mode == 'harvest_then_scrape' }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,16 +53,14 @@ jobs:
           path: urls.xlsx
           if-no-files-found: warn
 
-  # ── Job 2: Scrape Exhibitor Pages ─────────────────────────────────────────
-scrape:
+  scrape:
     name: Scrape Exhibitor Pages
     runs-on: ubuntu-22.04
-    needs: [harvest]
+    needs: harvest
     if: |
       always() &&
       (inputs.mode == 'scrape_only' || inputs.mode == 'harvest_then_scrape') &&
       (needs.harvest.result == 'success' || needs.harvest.result == 'skipped')
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -80,9 +76,7 @@ scrape:
           playwright install chromium
           playwright install-deps chromium
 
-      # For scrape_only mode: urls.xlsx must be committed to the repo,
-      # OR download it from a previous harvest artifact run.
-      - name: Download urls.xlsx from harvest job (if chaining)
+      - name: Download urls.xlsx from harvest job
         if: ${{ inputs.mode == 'harvest_then_scrape' }}
         uses: actions/download-artifact@v4
         with:
@@ -92,11 +86,11 @@ scrape:
         run: |
           if [ ! -f urls.xlsx ]; then
             echo "ERROR: urls.xlsx not found."
-            echo "Either commit it to the repo, or run 'harvest_urls' mode first."
+            echo "Either commit it to the repo, or run harvest_urls mode first."
             exit 1
           fi
           echo "urls.xlsx found."
-          
+
       - name: Run scraper
         env:
           TEST_MODE: ${{ inputs.test_mode == 'yes' && '3' || '0' }}
@@ -104,9 +98,7 @@ scrape:
 
       - name: List output files
         if: always()
-        run: |
-          echo "=== Output files ==="
-          ls -lh exhibitors_output.xlsx progress.json 2>/dev/null || echo "(none found)"
+        run: ls -lh exhibitors_output.xlsx progress.json 2>/dev/null || echo "(none found)"
 
       - name: Upload results
         if: always()

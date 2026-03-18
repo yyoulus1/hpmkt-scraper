@@ -4,15 +4,11 @@ harvest_urls.py
 Crawls the High Point Market exhibitor directory and collects all individual
 exhibitor URLs into urls.xlsx.
 
-Fixes applied vs v1:
-  - Use 'domcontentloaded' instead of 'networkidle' — the page never fully
-    settles due to analytics scripts, causing 30s timeouts on busy letters
-  - Longer timeout (60s) for the initial page load
-  - After page load, wait explicitly for the exhibitor links to appear
-  - Aggressive "Load More" loop — keep clicking until the button disappears
-  - Reduced concurrency to 2 to avoid rate-limiting / connection drops
-  - Each letter gets its own fresh browser context to avoid shared-state issues
-  - Retry logic: if a letter errors, try once more before giving up
+Strategy:
+  - The directory paginates via ?pageindex=N (10 results per page)
+  - We iterate pages 1, 2, 3... until a page returns no exhibitor links
+  - No alpha filtering needed — just page through everything sequentially
+  - Parallel workers each handle a chunk of page numbers
 """
 
 import asyncio
@@ -24,18 +20,20 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeoutErro
 import openpyxl
 
 BASE_URL      = "https://www.highpointmarket.org"
-DIRECTORY_URL = f"{BASE_URL}/ExhibitorDirectory"
+DIRECTORY_URL = f"{BASE_URL}/exhibitordirectory"
 
-ALPHA_LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ["0-9"]
-
-CONCURRENCY  = 2          # parallel letters — keep low to avoid rate limiting
+CONCURRENCY  = 3          # parallel browser tabs
 OUTPUT_FILE  = "urls.xlsx"
 LOAD_TIMEOUT = 60_000     # 60s for initial page load
-SEL_TIMEOUT  = 20_000     # 20s waiting for exhibitor links to appear
+SEL_TIMEOUT  = 15_000     # 15s waiting for exhibitor links
 
 
-async def get_urls_for_letter(browser, letter: str, attempt: int = 1) -> list[str]:
-    """Open one directory page filtered by alpha letter and collect all exhibitor links."""
+async def get_urls_for_page(browser, page_num: int) -> list[str] | None:
+    """
+    Scrape one directory page. Returns:
+      - list of URLs found (may be empty if page has no results → signals end)
+      - None on error (will be retried by caller)
+    """
     context = await browser.new_context(
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -47,73 +45,29 @@ async def get_urls_for_letter(browser, letter: str, attempt: int = 1) -> list[st
     page = await context.new_page()
 
     try:
-        # URL-encode the filter JSON — no spaces, clean encoding
-        filter_json = f'{{"Type":"Alpha","Values":["{letter}"]}}'
-        encoded = urllib.parse.quote(filter_json)
-        url = f"{DIRECTORY_URL}?filters={encoded}"
-
-        # domcontentloaded is much faster and reliable vs networkidle
+        url = f"{DIRECTORY_URL}?pageindex={page_num}"
         await page.goto(url, wait_until="domcontentloaded", timeout=LOAD_TIMEOUT)
+        await page.wait_for_timeout(2_500)  # let JS render the cards
 
-        # Give JS a moment to kick off the API call that loads exhibitor cards
-        await page.wait_for_timeout(3_000)
-
-        # Wait for at least one exhibitor link to appear
+        # Check if any exhibitor links loaded
         try:
             await page.wait_for_selector("a[href*='/exhibitor/']", timeout=SEL_TIMEOUT)
         except PWTimeoutError:
-            print(f"  [{letter}] No exhibitors found (or page timed out waiting for cards)")
-            return []
+            return []  # no results — signals end of pagination
 
-        # ── Load More loop ──────────────────────────────────────────────────
-        load_more_sel = (
-            "button:has-text('Load More'), "
-            "a:has-text('Load More'), "
-            "button:has-text('Show More'), "
-            "a:has-text('Show More')"
-        )
-
-        click_count = 0
-        while True:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1_500)
-
-            load_more = page.locator(load_more_sel)
-            if await load_more.count() == 0:
-                break
-
-            try:
-                await load_more.first.scroll_into_view_if_needed(timeout=3_000)
-                await load_more.first.click(timeout=5_000)
-                click_count += 1
-                print(f"  [{letter}] clicked Load More ({click_count}x)...")
-                await page.wait_for_timeout(2_000)
-            except Exception:
-                break
-
-        # ── Extract all /exhibitor/<id> links ───────────────────────────────
         hrefs = await page.locator("a[href*='/exhibitor/']").evaluate_all(
             "els => els.map(e => e.getAttribute('href'))"
         )
-        urls = set()
+        urls = []
         for href in hrefs:
             if href and re.match(r"^/exhibitor/\d+$", href):
-                urls.add(f"{BASE_URL}{href}")
+                urls.append(f"{BASE_URL}{href}")
 
-        suffix = f" (clicked Load More {click_count}x)" if click_count else ""
-        print(f"  [{letter}] found {len(urls)} exhibitors{suffix}")
-        return sorted(urls)
+        return urls
 
     except Exception as e:
-        msg = str(e)[:120]
-        if attempt < 3:
-            print(f"  [{letter}] ERROR attempt {attempt}: {msg} — retrying in 5s...")
-            await context.close()
-            await asyncio.sleep(5)
-            return await get_urls_for_letter(browser, letter, attempt + 1)
-        else:
-            print(f"  [{letter}] FAILED after {attempt} attempts: {msg}")
-            return []
+        print(f"  [page {page_num}] ERROR: {str(e)[:100]}")
+        return None  # signals retry
 
     finally:
         try:
@@ -131,20 +85,49 @@ async def harvest_all() -> list[str]:
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
 
-        semaphore = asyncio.Semaphore(CONCURRENCY)
+        # We don't know total pages upfront, so use a shared counter
+        # and stop when we hit an empty page
+        page_num = 1
+        page_lock = asyncio.Lock()
+        stop_event = asyncio.Event()
+        results_lock = asyncio.Lock()
 
-        async def bounded(letter):
-            async with semaphore:
-                return await get_urls_for_letter(browser, letter)
+        async def worker(worker_id: int):
+            nonlocal page_num
+            while not stop_event.is_set():
+                async with page_lock:
+                    if stop_event.is_set():
+                        break
+                    current = page_num
+                    page_num += 1
 
-        tasks = [bounded(letter) for letter in ALPHA_LETTERS]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+                # Retry up to 3 times on error
+                urls = None
+                for attempt in range(1, 4):
+                    urls = await get_urls_for_page(browser, current)
+                    if urls is not None:
+                        break
+                    if attempt < 3:
+                        print(f"  [page {current}] retrying (attempt {attempt+1})...")
+                        await asyncio.sleep(3)
 
-        for result in results:
-            if isinstance(result, list):
-                all_urls.update(result)
-            elif isinstance(result, Exception):
-                print(f"  Unexpected exception: {result}")
+                if urls is None:
+                    print(f"  [page {current}] failed after 3 attempts, skipping")
+                    continue
+
+                if len(urls) == 0:
+                    print(f"  [page {current}] empty — stopping")
+                    stop_event.set()
+                    break
+
+                async with results_lock:
+                    all_urls.update(urls)
+
+                print(f"  [page {current}] found {len(urls)} exhibitors"
+                      f" (total so far: {len(all_urls)})")
+
+        workers = [asyncio.create_task(worker(i + 1)) for i in range(CONCURRENCY)]
+        await asyncio.gather(*workers)
 
         await browser.close()
 
@@ -170,7 +153,7 @@ def save_to_excel(urls: list[str], path: str):
 
 async def main():
     print("=== High Point Market — URL Harvester ===")
-    print(f"Crawling {len(ALPHA_LETTERS)} alpha buckets with concurrency={CONCURRENCY}...\n")
+    print(f"Paginating through directory with concurrency={CONCURRENCY}...\n")
     t0 = time.time()
 
     urls = await harvest_all()

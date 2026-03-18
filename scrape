@@ -1,0 +1,111 @@
+name: High Point Market Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which step to run'
+        required: true
+        default: 'scrape_only'
+        type: choice
+        options:
+          - harvest_urls        # Step 1 — build urls.xlsx from the directory
+          - scrape_only         # Step 2 — scrape exhibitor pages (uses uploaded urls.xlsx)
+          - harvest_then_scrape # Both steps in sequence
+      test_mode:
+        description: 'Test mode — scrape only first 3 URLs (scrape step only)'
+        required: true
+        default: 'yes'
+        type: choice
+        options: ['yes', 'no']
+
+jobs:
+  # ── Job 1: Harvest URLs ───────────────────────────────────────────────────
+  harvest:
+    name: Harvest Exhibitor URLs
+    runs-on: ubuntu-22.04
+    if: ${{ inputs.mode == 'harvest_urls' || inputs.mode == 'harvest_then_scrape' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run URL harvester
+        run: python harvest_urls.py
+
+      - name: List output files
+        run: ls -lh urls.xlsx || echo "urls.xlsx not found"
+
+      - name: Upload urls.xlsx as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exhibitor-urls
+          path: urls.xlsx
+          if-no-files-found: warn
+
+  # ── Job 2: Scrape Exhibitor Pages ─────────────────────────────────────────
+  scrape:
+    name: Scrape Exhibitor Pages
+    runs-on: ubuntu-22.04
+    needs: []   # can run independently; set needs: [harvest] if chaining
+    if: ${{ inputs.mode == 'scrape_only' || inputs.mode == 'harvest_then_scrape' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      # For scrape_only mode: urls.xlsx must be committed to the repo,
+      # OR download it from a previous harvest artifact run.
+      - name: Verify urls.xlsx exists
+        run: |
+          if [ ! -f urls.xlsx ]; then
+            echo "ERROR: urls.xlsx not found."
+            echo "Either commit it to the repo, or run 'harvest_urls' mode first"
+            echo "and download the artifact, then commit it."
+            exit 1
+          fi
+          echo "urls.xlsx found — $(wc -l < urls.xlsx) lines"
+
+      - name: Run scraper
+        env:
+          TEST_MODE: ${{ inputs.test_mode == 'yes' && '3' || '0' }}
+        run: python scraper.py
+
+      - name: List output files
+        if: always()
+        run: |
+          echo "=== Output files ==="
+          ls -lh exhibitors_output.xlsx progress.json 2>/dev/null || echo "(none found)"
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: exhibitor-results
+          path: |
+            exhibitors_output.xlsx
+            progress.json
+          if-no-files-found: warn

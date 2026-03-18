@@ -56,11 +56,14 @@ jobs:
           if-no-files-found: warn
 
   # ── Job 2: Scrape Exhibitor Pages ─────────────────────────────────────────
-  scrape:
+scrape:
     name: Scrape Exhibitor Pages
     runs-on: ubuntu-22.04
-    needs: []   # can run independently; set needs: [harvest] if chaining
-    if: ${{ inputs.mode == 'scrape_only' || inputs.mode == 'harvest_then_scrape' }}
+    needs: [harvest]
+    if: |
+      always() &&
+      (inputs.mode == 'scrape_only' || inputs.mode == 'harvest_then_scrape') &&
+      (needs.harvest.result == 'success' || needs.harvest.result == 'skipped')
 
     steps:
       - name: Checkout repository
@@ -79,16 +82,21 @@ jobs:
 
       # For scrape_only mode: urls.xlsx must be committed to the repo,
       # OR download it from a previous harvest artifact run.
+      - name: Download urls.xlsx from harvest job (if chaining)
+        if: ${{ inputs.mode == 'harvest_then_scrape' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: exhibitor-urls
+
       - name: Verify urls.xlsx exists
         run: |
           if [ ! -f urls.xlsx ]; then
             echo "ERROR: urls.xlsx not found."
-            echo "Either commit it to the repo, or run 'harvest_urls' mode first"
-            echo "and download the artifact, then commit it."
+            echo "Either commit it to the repo, or run 'harvest_urls' mode first."
             exit 1
           fi
-          echo "urls.xlsx found — $(wc -l < urls.xlsx) lines"
-
+          echo "urls.xlsx found."
+          
       - name: Run scraper
         env:
           TEST_MODE: ${{ inputs.test_mode == 'yes' && '3' || '0' }}
